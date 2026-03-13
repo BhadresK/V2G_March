@@ -18,7 +18,6 @@ Changes vs Prototype1:
 """
 
 from __future__ import annotations
-import warnings
 import sys
 import numpy as np
 import pandas as pd
@@ -28,7 +27,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.gridspec import GridSpec
 from dataclasses import dataclass
-from typing import Optional, Dict, List
+from typing import Optional
 from pathlib import Path
 
 
@@ -85,13 +84,13 @@ def generate_abbreviation_legend(out: str = "abbreviation_legend.png") -> None:
         line, lines = "", []
         for w in words:
             if len(line + w) > 48:
-                lines.append(line.strip()); line = w + " "
+                lines.append(line.strip()); line = w + " "  # noqa: E702
             else:
                 line += w + " "
         lines.append(line.strip())
         ax.text(0.30, y, lines[0], ha="left", va="top", fontsize=7.8,
                 color="#212121", transform=ax.transAxes)
-        for i, l in enumerate(lines[1:], 1):
+        for i, l in enumerate(lines[1:], 1):  # noqa: E741
             ax.text(0.30, y - i * 0.018, l, ha="left", va="top", fontsize=7.8,
                     color="#212121", transform=ax.transAxes)
         y -= 0.040 + max(0, (len(lines) - 1) * 0.018)
@@ -1711,7 +1710,7 @@ def main() -> None:
         deg_df = deg_sensitivity(v2g, buy, v2g_p, tru, plugged, deg_values, soc_init_pct, soc_final_pct)
 
         print_report(v2g, results, deg_df, season=label, price_source=price_source)
-        plot_all(v2g, hours, A, B, C, D, deg_df, season=label, out=f"results_{season}.png")
+        # Seasonal plots removed — only yearly analysis is generated
 
     print("\n" + "=" * 65)
     print("  RUNNING FULL 365-DAY YEAR ANALYSIS")
@@ -1726,13 +1725,13 @@ def main() -> None:
     annual_savings_dumb = annual_cost_a - annual_cost_milp
 
     print(f"\n{'='*65}")
-    print(f"  TRUE ANNUAL SUMMARY (365 Days) - Single Trailer (Scenario C MILP)")
+    print("  TRUE ANNUAL SUMMARY (365 Days) - Single Trailer (Scenario C MILP)")
     print(f"{'='*65}")
     print(f"  Annual energy cost (Dumb):        EUR{annual_cost_a:>8,.0f}/year")
     print(f"  Annual energy cost (MILP):        EUR{annual_cost_milp:>8,.0f}/year")
     print(f"  Annual V2G revenue (MILP):        EUR{annual_v2g_milp:>8,.0f}/year")
     print(f"  Annual savings vs Dumb charging:  EUR{annual_savings_dumb:>8,.0f}/year")
-    print(f"  [Agora 2025 benchmark for car:    ~EUR500/year for arbitrage only]")
+    print("  [Agora 2025 benchmark for car:    ~EUR500/year for arbitrage only]")
     print()
 
 

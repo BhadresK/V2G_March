@@ -9,7 +9,6 @@ All V2GParams fields are exposed as editable form inputs.
 import os
 import sys
 import json
-import time
 import traceback
 import threading
 import queue
@@ -58,9 +57,12 @@ def run_optimisation(
     transformer_limit_kVA: float = 0.0,
     # ── Data ────────────────────────────────────────────────────
     csv_path:              str   = "",
+    # ── Mode ────────────────────────────────────────────────────
+    run_mode:              str   = "full_year",
+    specific_date:         str   = "",
 ) -> dict:
     """
-    Runs the full 4-season V2G optimisation.
+    Runs the full 4-season V2G optimisation OR single-day analysis.
     All V2GParams fields are set from the GUI form before any solver call.
     """
 
@@ -117,8 +119,30 @@ def run_optimisation(
     log("Generating equations reference card...")
     v2g_mod.generate_equations_card(str(OUT_DIR / "equations_reference.png"))
 
-    # ── Run all seasons ─────────────────────────────────────────
-    hours      = np.arange(v2g.n_slots) * v2g.dt_h
+    # ── Branch: Full Year vs Single Day ─────────────────────────
+    if run_mode == "single_day" and specific_date:
+        log(f"MODE: Single-day analysis for {specific_date}")
+        return run_single_day_optimisation(
+            v2g, csv_path, specific_date,
+            soc_init_pct, soc_final_pct, log
+        )
+    else:
+        log("MODE: Full year analysis (all 4 seasons)")
+        return run_full_year_optimisation(
+            v2g, csv_path,
+            soc_init_pct, soc_final_pct, log
+        )
+
+
+def run_full_year_optimisation(
+    v2g,
+    csv_path: str,
+    soc_init_pct: float,
+    soc_final_pct: float,
+    log,
+) -> dict:
+    """Full year analysis across 4 seasonal scenarios."""
+    np.arange(v2g.n_slots) * v2g.dt_h
     deg_values = v2g_mod.load_deg_sensitivity(v2g)
 
     all_season_results: dict = {}
@@ -153,19 +177,19 @@ def run_optimisation(
         log(f"  Buy: {buy.min()*1000:.1f}-{buy.max()*1000:.1f} EUR/MWh | "
             f"Plugged: {int(plugged.sum()*v2g.dt_h)}h/day")
 
-        log(f"  Running A - Dumb...")
+        log("  Running A - Dumb...")
         A = v2g_mod.run_dumb(v2g, buy, v2g_p, tru, plugged,
                              soc_init_pct, soc_final_pct)
 
-        log(f"  Running B - Smart (no V2G)...")
+        log("  Running B - Smart (no V2G)...")
         B = v2g_mod.run_smart_no_v2g(v2g, buy, v2g_p, tru, plugged,
                                       soc_init_pct, soc_final_pct)
 
-        log(f"  Running C - MILP Day-Ahead...")
+        log("  Running C - MILP Day-Ahead...")
         C = v2g_mod.run_milp_day_ahead(v2g, buy, v2g_p, tru, plugged,
                                         soc_init_pct, soc_final_pct)
 
-        log(f"  Running D - MPC (96 solves)...")
+        log("  Running D - MPC (96 solves)...")
         D = v2g_mod.run_mpc_day_ahead(v2g, buy, v2g_p, tru, plugged,
                                        soc_init_pct, soc_final_pct,
                                        label="D - MPC perfect")
@@ -173,16 +197,11 @@ def run_optimisation(
         results = {"A": A, "B": B, "C": C, "D": D}
         all_season_results[season] = results
 
-        log(f"  Running degradation sensitivity...")
-        deg_df = v2g_mod.deg_sensitivity(
+        log("  Running degradation sensitivity...")
+        v2g_mod.deg_sensitivity(
             v2g, buy, v2g_p, tru, plugged,
             deg_values, soc_init_pct, soc_final_pct
         )
-
-        out_png = str(OUT_DIR / f"results_{season}.png")
-        log(f"  Plotting -> results_{season}.png")
-        v2g_mod.plot_all(v2g, hours, A, B, C, D, deg_df,
-                         season=label, out=out_png)
 
         ref = A.cost_eur_day
         season_summary.append({
@@ -202,25 +221,19 @@ def run_optimisation(
         annual_v2g_milp     += C.v2g_revenue_eur_day * days_per_year
         annual_savings_dumb += (A.cost_eur_day - C.cost_eur_day) * days_per_year
 
-    # ── Additional cross-season analysis plot ───────────────────
-    log("Generating additional analysis graphs...")
-    buy_w, v2g_p_w, _ = v2g_mod.load_prices_from_csv(csv_path, v2g, season="winter")
-    v2g_mod.plot_additional_analysis(
-        v2g, hours,
-        all_season_results["winter"]["A"],
-        all_season_results["winter"]["B"],
-        all_season_results["winter"]["C"],
-        all_season_results["winter"]["D"],
-        buy_w, v2g_p_w,
-        all_season_results,
-        csv_path,
-        out=str(OUT_DIR / "additional_analysis.png"),
+    # ── Annual aggregated values ────────────────────────────────
+    log("Generating annual aggregated analysis plot...")
+    v2g_mod.plot_full_year_analysis(
+        v2g_mod.run_full_year(v2g, csv_path, soc_init_pct, soc_final_pct),
+        v2g,
+        out=str(OUT_DIR / "full_year_analysis.png")
     )
 
     summary = {
         "annual_cost_milp":       round(annual_cost_milp, 0),
         "annual_v2g_revenue":     round(annual_v2g_milp, 0),
         "annual_savings_vs_dumb": round(annual_savings_dumb, 0),
+        "annual_charge_cost":     round(annual_cost_milp + annual_v2g_milp, 0),
         "seasons":                season_summary,
         "params_used": {
             "usable_capacity_kWh":   v2g.usable_capacity_kWh,
@@ -239,15 +252,132 @@ def run_optimisation(
         "images": [
             "abbreviation_legend.png",
             "equations_reference.png",
-            "results_winter.png",
-            "results_summer.png",
-            "results_winter_weekend.png",
-            "results_summer_weekend.png",
-            "additional_analysis.png",
+            "full_year_analysis.png",
         ],
+        "mode": "full_year",
     }
 
     log(f"✓ DONE — Annual savings vs Dumb: EUR{annual_savings_dumb:,.0f}/yr")
+    log("__DONE__")
+    return summary
+
+
+def run_single_day_optimisation(
+    v2g,
+    csv_path: str,
+    specific_date: str,
+    soc_init_pct: float,
+    soc_final_pct: float,
+    log,
+) -> dict:
+    """Single-day analysis for a specific date."""
+    from datetime import datetime
+    
+    hours = np.arange(v2g.n_slots) * v2g.dt_h
+    
+    # Parse the date
+    try:
+        date_obj = datetime.strptime(specific_date, "%Y-%m-%d").date()
+        date_str = date_obj.strftime("%B %d, %Y")
+        log(f"  Extracting data for {date_str}...")
+    except ValueError:
+        raise ValueError("Invalid date format. Use YYYY-MM-DD (e.g., 2025-01-15)")
+    
+    # Load all prices (df has index as datetime, columns: datetime_str, price_eur_mwh, price_eur_kwh, etc.)
+    df = v2g_mod._load_smard_csv(csv_path)
+    
+    # Filter for the specific date using the datetime index
+    mask = df.index.date == date_obj
+    day_df = df[mask]
+    
+    if len(day_df) < 96:
+        raise ValueError(
+            f"Not enough data for {specific_date}. Found {len(day_df)} slots, need 96."
+        )
+    
+    # Extract price data for this day (already in EUR/kWh)
+    buy = day_df['price_eur_kwh'].values[:96]
+    
+    # V2G prices (simplified: 70% of buy price)
+    v2g_p = buy * 0.7
+    
+    # Load availability and TRU
+    tru, plugged = v2g_mod.build_load_and_availability(v2g, dwell="DayTrip")
+    ROLL = 68
+    tru     = np.roll(tru,     -ROLL)
+    plugged = np.roll(plugged, -ROLL)
+    
+    log(f"  Buy prices: {buy.min()*1000:.1f}-{buy.max()*1000:.1f} EUR/MWh")
+    log(f"  Plugged: {int(plugged.sum()*v2g.dt_h)}h/day")
+    
+    # Run scenarios
+    log("  Running A - Dumb...")
+    A = v2g_mod.run_dumb(v2g, buy, v2g_p, tru, plugged, soc_init_pct, soc_final_pct)
+
+    log("  Running B - Smart (no V2G)...")
+    B = v2g_mod.run_smart_no_v2g(v2g, buy, v2g_p, tru, plugged, soc_init_pct, soc_final_pct)
+
+    log("  Running C - MILP...")
+    C = v2g_mod.run_milp_day_ahead(v2g, buy, v2g_p, tru, plugged, soc_init_pct, soc_final_pct)
+
+    log("  Running D - MPC...")
+    D = v2g_mod.run_mpc_day_ahead(v2g, buy, v2g_p, tru, plugged, soc_init_pct, soc_final_pct, label="D - MPC")
+
+    # Generate degradation sensitivity for plotting
+    log("  Analyzing degradation sensitivity...")
+    deg_values = v2g_mod.load_deg_sensitivity(v2g)
+    deg_df = v2g_mod.deg_sensitivity(v2g, buy, v2g_p, tru, plugged, deg_values, soc_init_pct, soc_final_pct)
+
+    # Generate single-day plot
+    log("  Generating single-day plot...")
+    v2g_mod.plot_all(v2g, hours, A, B, C, D, deg_df, season=date_str, out=str(OUT_DIR / "single_day_results.png"))
+    
+    # Calculate additional metrics
+    dt_h = v2g.dt_h
+    daily_charge_kwh = np.sum(C.p_charge) * dt_h
+    np.sum(C.p_discharge) * dt_h
+    
+    # Battery losses
+    charge_loss = np.sum(C.p_charge) * dt_h * (1.0 - v2g.eta_charge)
+    discharge_loss = np.sum(C.p_discharge) * dt_h * (1.0 - 1.0 / v2g.eta_discharge)
+    battery_loss = charge_loss + discharge_loss
+    
+    summary = {
+        "specific_date":          specific_date,
+        "daily_cost_dumb":        round(A.cost_eur_day, 4),
+        "daily_cost_smart":       round(B.cost_eur_day, 4),
+        "daily_cost_milp":        round(C.cost_eur_day, 4),
+        "daily_cost_mpc":         round(D.cost_eur_day, 4),
+        "daily_v2g_revenue_milp": round(C.v2g_revenue_eur_day, 4),
+        "daily_v2g_revenue_mpc":  round(D.v2g_revenue_eur_day, 4),
+        "daily_v2g_export_kwh":   round(C.v2g_export_kwh_day, 2),
+        "daily_savings_milp_vs_dumb": round(A.cost_eur_day - C.cost_eur_day, 4),
+        "daily_savings_mpc_vs_dumb":  round(A.cost_eur_day - D.cost_eur_day, 4),
+        "daily_charge_kwh":       round(daily_charge_kwh, 2),
+        "daily_battery_loss":     round(battery_loss, 2),
+        "params_used": {
+            "usable_capacity_kWh":   v2g.usable_capacity_kWh,
+            "soc_min_pct":           v2g.soc_min_pct,
+            "soc_max_pct":           v2g.soc_max_pct,
+            "charge_power_kW":       v2g.charge_power_kW,
+            "discharge_power_kW":    v2g.discharge_power_kW,
+            "eta_charge":            v2g.eta_charge,
+            "eta_discharge":         v2g.eta_discharge,
+            "deg_cost_eur_kwh":      v2g.deg_cost_eur_kwh,
+            "soc_init_pct":          soc_init_pct,
+            "soc_final_pct":         soc_final_pct,
+            "depot_connection_kVA":  v2g.depot_connection_kVA,
+            "transformer_limit_kVA": v2g.transformer_limit_kVA,
+        },
+        "images": [
+            "abbreviation_legend.png",
+            "equations_reference.png",
+            "single_day_results.png",
+        ],
+        "mode": "single_day",
+    }
+    
+    log(f"✓ DONE — Daily savings (MILP vs Dumb): EUR{A.cost_eur_day - C.cost_eur_day:.4f}/day")
     log("__DONE__")
     return summary
 
@@ -288,6 +418,10 @@ def run():
     deg_cost              = fget("deg_cost",              0.02)
     depot_connection_kVA  = fget("depot_connection_kVA",  0.0)
     transformer_limit_kVA = fget("transformer_limit_kVA", 0.0)
+    
+    # ── Mode parameters ────────────────────────────────────────
+    run_mode = data.get("run_mode", "full_year")
+    specific_date = data.get("specific_date", "")
 
     # Basic validation
     errors = []
@@ -337,6 +471,8 @@ def run():
                     deg_cost              = deg_cost,
                     depot_connection_kVA  = depot_connection_kVA,
                     transformer_limit_kVA = transformer_limit_kVA,
+                    run_mode              = run_mode,
+                    specific_date         = specific_date,
                 )
                 progress_queue.put(json.dumps({
                     "type": "result",
@@ -637,6 +773,25 @@ HTML_PAGE = r"""
     <div class="panel">
       <h2>⚙️ Optimisation Parameters</h2>
 
+      <!-- ══ SECTION 0: Analysis Mode ══ -->
+      <div class="section-header open" onclick="toggleSection(this)">
+        📅 Analysis Mode <span class="arrow">▶</span>
+      </div>
+      <div class="section-body open">
+        <div class="field">
+          <label>Select Mode</label>
+          <select id="runMode" style="width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; font-size: 0.95rem;">
+            <option value="full_year">Full Year Analysis (4 seasons)</option>
+            <option value="single_day">Single Day Analysis</option>
+          </select>
+        </div>
+        <div class="field" id="dateFieldContainer" style="display: none;">
+          <label>Specific Date <span class="unit">YYYY-MM-DD</span></label>
+          <div class="hint">Select a date to analyze (must be in 2025)</div>
+          <input type="date" id="specific_date" min="2025-01-01" max="2025-12-31" value="2025-01-15">
+        </div>
+      </div>
+
       <!-- ══ SECTION 1: Mission ══ -->
       <div class="section-header open" onclick="toggleSection(this)">
         🚛 Mission / SoC Targets <span class="arrow">▶</span>
@@ -788,6 +943,16 @@ const seasonBody = document.getElementById("seasonBody");
 const gallery    = document.getElementById("gallery");
 const paramsEcho = document.getElementById("paramsEcho");
 
+// ── Mode selector handler ─────────────────────────────────────────
+document.getElementById("runMode").addEventListener("change", function(e) {
+  const dateFieldContainer = document.getElementById("dateFieldContainer");
+  if (e.target.value === "single_day") {
+    dateFieldContainer.style.display = "block";
+  } else {
+    dateFieldContainer.style.display = "none";
+  }
+});
+
 function appendLog(msg, cls = "") {
   const span = document.createElement("span");
   span.className = cls;
@@ -803,7 +968,12 @@ function getNum(id, fallback) {
 
 function startRun() {
   // Collect all parameters
+  const runMode = document.getElementById("runMode").value;
+  const specificDate = document.getElementById("specific_date").value;
+  
   const params = {
+    run_mode:              runMode,
+    specific_date:         specificDate,
     soc_init:              getNum("soc_init",              45),
     soc_final:             getNum("soc_final",             100),
     soc_min_pct:           getNum("soc_min_pct",           20),
@@ -817,6 +987,11 @@ function startRun() {
     depot_connection_kVA:  getNum("depot_connection_kVA",  0),
     transformer_limit_kVA: getNum("transformer_limit_kVA", 0),
   };
+
+  // Validate single_day mode
+  if (runMode === "single_day" && !specificDate) {
+    alert("Please select a date for single-day analysis."); return;
+  }
 
   // Client-side sanity checks
   if (params.soc_init < 20 || params.soc_init > 100) {
@@ -848,7 +1023,8 @@ function startRun() {
   btnRun.disabled = true;
   btnRun.textContent = "⏳ Running...";
 
-  appendLog("Starting optimisation...", "log-info");
+  const modeStr = runMode === "single_day" ? `Single-day (${specificDate})` : "Full Year (4 seasons)";
+  appendLog(`Starting optimisation (${modeStr})...`, "log-info");
   appendLog(`  Arrival SoC: ${params.soc_init}%  |  Departure SoC: ${params.soc_final}%`, "log-info");
   appendLog(`  Battery: ${params.usable_capacity_kWh} kWh usable  |  P_c/d: ${params.charge_power_kW}/${params.discharge_power_kW} kW`, "log-info");
   appendLog(`  η_c/d: ${params.eta_charge}/${params.eta_discharge}  |  deg: ${params.deg_cost} EUR/kWh`, "log-info");
@@ -927,34 +1103,62 @@ function showResults(data) {
       `Grid limits: depot=${p.depot_connection_kVA} kVA  transformer=${p.transformer_limit_kVA} kVA`;
   }
 
-  // KPI cards
-  const kpis = [
-    { label: "Annual Cost (MILP)",    value: `€${Number(data.annual_cost_milp).toLocaleString()}`,        green: false },
-    { label: "Annual V2G Revenue",    value: `€${Number(data.annual_v2g_revenue).toLocaleString()}`,      green: true  },
-    { label: "Annual Savings vs Dumb",value: `€${Number(data.annual_savings_vs_dumb).toLocaleString()}`,  green: true  },
-  ];
-  kpiGrid.innerHTML = kpis.map(k => `
-    <div class="kpi-card ${k.green ? 'green' : ''}">
-      <div class="kpi-value">${k.value}</div>
-      <div class="kpi-label">${k.label}</div>
-    </div>
-  `).join("");
+  // Mode-specific KPIs
+  if (data.mode === "single_day") {
+    // Single-day results
+    const kpis = [
+      { label: "Date", value: data.specific_date, green: false },
+      { label: "Cost - Dumb (A)", value: `€${data.daily_cost_dumb.toFixed(2)}`, green: false },
+      { label: "Cost - MILP (C)", value: `€${data.daily_cost_milp.toFixed(2)}`, green: false },
+      { label: "V2G Revenue - MILP", value: `€${data.daily_v2g_revenue_milp.toFixed(2)}`, green: true },
+      { label: "V2G Export - kWh", value: `${data.daily_v2g_export_kwh} kWh`, green: true },
+      { label: "Savings (C vs A)", value: `€${data.daily_savings_milp_vs_dumb.toFixed(2)}`, green: true },
+      { label: "Charge Energy", value: `${data.daily_charge_kwh} kWh`, green: false },
+      { label: "Battery Loss", value: `${data.daily_battery_loss} kWh`, green: false },
+    ];
+    
+    document.getElementById("seasonTable").style.display = "none";
+    
+    const kpiHtml = kpis.map(k => `
+      <div class="kpi-card ${k.green ? 'green' : ''}">
+        <div class="kpi-label">${k.label}</div>
+        <div class="kpi-value">${k.value}</div>
+      </div>
+    `).join("");
+    kpiGrid.innerHTML = kpiHtml;
+    
+  } else {
+    // Full year results
+    document.getElementById("seasonTable").style.display = "table";
+    
+    const kpis = [
+      { label: "Annual Cost (MILP)", value: `€${Number(data.annual_cost_milp).toLocaleString()}`, green: false },
+      { label: "Annual V2G Revenue", value: `€${Number(data.annual_v2g_revenue).toLocaleString()}`, green: true },
+      { label: "Annual Savings vs Dumb", value: `€${Number(data.annual_savings_vs_dumb).toLocaleString()}`, green: true },
+    ];
+    kpiGrid.innerHTML = kpis.map(k => `
+      <div class="kpi-card ${k.green ? 'green' : ''}">
+        <div class="kpi-value">${k.value}</div>
+        <div class="kpi-label">${k.label}</div>
+      </div>
+    `).join("");
 
-  // Season table
-  seasonBody.innerHTML = data.seasons.map(s => `
-    <tr>
-      <td><strong>${s.season}</strong></td>
-      <td>${s.days_per_year}</td>
-      <td>${s.A_cost.toFixed(4)}</td>
-      <td>${s.B_cost.toFixed(4)}</td>
-      <td>${s.C_cost.toFixed(4)}</td>
-      <td>${s.D_cost.toFixed(4)}</td>
-      <td>${s.C_v2g_rev.toFixed(4)}</td>
-      <td style="color:${s.C_savings_vs_A > 0 ? '#43a047' : '#e53935'}; font-weight:700">
-        ${s.C_savings_vs_A > 0 ? '+' : ''}${s.C_savings_vs_A.toFixed(4)}
-      </td>
-    </tr>
-  `).join("");
+    // Season table
+    seasonBody.innerHTML = data.seasons.map(s => `
+      <tr>
+        <td><strong>${s.season}</strong></td>
+        <td>${s.days_per_year}</td>
+        <td>${s.A_cost.toFixed(4)}</td>
+        <td>${s.B_cost.toFixed(4)}</td>
+        <td>${s.C_cost.toFixed(4)}</td>
+        <td>${s.D_cost.toFixed(4)}</td>
+        <td>${s.C_v2g_rev.toFixed(4)}</td>
+        <td style="color:${s.C_savings_vs_A > 0 ? '#43a047' : '#e53935'}; font-weight:700">
+          ${s.C_savings_vs_A > 0 ? '+' : ''}${s.C_savings_vs_A.toFixed(4)}
+        </td>
+      </tr>
+    `).join("");
+  }
 
   // Image gallery
   const ts = Date.now();
